@@ -7,48 +7,43 @@ from sklearn.preprocessing import StandardScaler
 def butter_highpass_filter(data, cutoff=20, fs=25600, order=5):
     """
     Mandatory for Journal Quality: Removes numerical drift.
-    Zero-phase (filtfilt) ensures x, v, and a are perfectly synced in time.
+    Zero-phase (filtfilt) ensures x, v, and a are perfectly synced.
     """
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
     b, a = butter(order, normal_cutoff, btype='high', analog=False)
     return filtfilt(b, a, data)
 
-def integrate_and_scale(accel_envelope, fs=25600):
+def integrate_and_scale(accel_signal, fs=25600):
     """
-    Step 1C:
-    1. Zero-mean the envelope (Turning energy into energy fluctuations).
+    Step 1C (Fixed Physics):
+    1. Zero-mean the OSCILLATORY signal (Not the envelope).
     2. Numerical Integration with actual dt.
     3. Aggressive Drift Removal (HPF 20Hz).
-    4. Z-Score Scaling (The PINN Gradient Secret).
+    4. Z-Score Scaling for PINN stability.
     """
     dt = 1.0 / fs
     
-    # --- CRITICAL PHYSICS STEP: ZERO-MEAN THE ENVELOPE ---
-    # Since envelopes are strictly positive, we subtract the mean to 
-    # allow the system to 'vibrate' around zero for the ODE Ma + Cv + Kx = 0
-    a_centered = accel_envelope - np.mean(accel_envelope, axis=0)
+    # --- PHYSICAL RECTIFICATION ---
+    # We ensure the signal is centered. Since this is the bandpassed 
+    # vibration, it will naturally oscillate around zero.
+    a_centered = accel_signal - np.mean(accel_signal, axis=0)
     
-    # Initialize containers
     velocity = np.zeros_like(a_centered)
     displacement = np.zeros_like(a_centered)
     
-    # --- Part 1: State Reconstruction (Multivariate) ---
+    # --- Part 1: State Reconstruction ---
     for i in range(2): # 0=Horizontal, 1=Vertical
-        # Accel -> Velocity
+        # First Integration: Accel -> Velocity
         v_raw = cumulative_trapezoid(a_centered[:, i], dx=dt, initial=0)
         velocity[:, i] = butter_highpass_filter(v_raw, cutoff=20, fs=fs)
         
-        # Velocity -> Displacement
+        # Second Integration: Velocity -> Displacement
         x_raw = cumulative_trapezoid(velocity[:, i], dx=dt, initial=0)
         displacement[:, i] = butter_highpass_filter(x_raw, cutoff=20, fs=fs)
     
-    # --- Part 2: Standardization (Non-dimensionalization) ---
-    # We scale x, v, a so they all live in the range ~[-3, 3].
-    # Without this, the DeepXDE Physics Loss will fail to converge.
-    scaler_x = StandardScaler()
-    scaler_v = StandardScaler()
-    scaler_a = StandardScaler()
+    # --- Part 2: Standardization ---
+    scaler_x, scaler_v, scaler_a = StandardScaler(), StandardScaler(), StandardScaler()
     
     x_s = scaler_x.fit_transform(displacement)
     v_s = scaler_v.fit_transform(velocity)
@@ -61,50 +56,43 @@ def integrate_and_scale(accel_envelope, fs=25600):
 if __name__ == "__main__":
     import os
     import sys
-    sys.path.append(os.getcwd()) # Ensure project root is in path
+    sys.path.append(os.getcwd())
     
-    # Import your previous logic
     from data_prep.load_xjtu import load_xjtu_sy_folder
-    from data_prep.envelope_engine import apply_hilbert_envelope
+    # We need a function that returns the BANDPASSED signal, not just the envelope
+    from scipy.signal import butter, filtfilt
 
-    # 1. Pipeline Execution (Healthy Data)
+    def get_bandpassed_signal(signal, fs=25600):
+        nyq = 0.5 * fs
+        b, a = butter(4, [2000/nyq, 10000/nyq], btype='band')
+        return filtfilt(b, a, signal, axis=0)
+
+    # 1. Pipeline Execution
     DATA_FOLDER = r"C:\Vibration_Data_Master\XJTU_SY\Bearing1_1"
-    print("Executing Step 1C Pipeline...")
-    
     raw_accel = load_xjtu_sy_folder(DATA_FOLDER, max_files=5)
-    envelope = apply_hilbert_envelope(raw_accel, fs=25600)
+    
+    # PHYSICS FIX: Integrate the BANDPASSED signal, not the envelope
+    bandpassed_signal = get_bandpassed_signal(raw_accel, fs=25600)
     
     # Execute Step 1C
-    x_s, v_s, a_s, scalers = integrate_and_scale(envelope, fs=25600)
+    x_s, v_s, a_s, scalers = integrate_and_scale(bandpassed_signal, fs=25600)
     
     # 2. Results Verification
-    print(f"Step 1C Success. Samples Processed: {x_s.shape[0]}")
-    print(f"Displacement Scaled Range: [{x_s.min():.2f}, {x_s.max():.2f}]")
+    print(f"Step 1C Success. Samples: {x_s.shape[0]}")
+    
+    # 3. Save Outputs (Mandatory for Phase 1D)
+    os.makedirs("data_prep", exist_ok=True)
+    np.save("data_prep/x_s.npy", x_s)
+    np.save("data_prep/v_s.npy", v_s)
+    np.save("data_prep/a_s.npy", a_s)
+    print("Saved states to data_prep/")
 
-    # 3. Visualization: The State-Space Trajectory (The Baseline)
-    plt.figure(figsize=(14, 8))
-    
-    # Top Plot: Time-Sync Check
-    plt.subplot(2, 1, 1)
-    plt.plot(a_s[:1000, 0], label="Scaled Accel (a)", alpha=0.6)
-    plt.plot(x_s[:1000, 0], label="Scaled Disp (x)", linewidth=2)
-    plt.title("Step 1C: Physics-Consistent Scaled States (Healthy)")
-    plt.legend()
-    plt.grid(True)
-    
-    # Bottom Left: Horizontal Phase Space
-    plt.subplot(2, 2, 3)
-    plt.plot(x_s[:10000, 0], v_s[:10000, 0], color='blue', alpha=0.3)
-    plt.axhline(0, color='black', lw=1); plt.axvline(0, color='black', lw=1)
-    plt.title("Horizontal Phase Space (x vs v)")
-    plt.xlabel("Scaled Position"); plt.ylabel("Scaled Velocity")
-    
-    # Bottom Right: Vertical Phase Space
-    plt.subplot(2, 2, 4)
-    plt.plot(x_s[:10000, 1], v_s[:10000, 1], color='red', alpha=0.3)
-    plt.axhline(0, color='black', lw=1); plt.axvline(0, color='black', lw=1)
-    plt.title("Vertical Phase Space (x vs v)")
-    plt.xlabel("Scaled Position"); plt.ylabel("Scaled Velocity")
-    
-    plt.tight_layout()
+    # 4. Visualization
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(x_s[:1000, 0], v_s[:1000, 0])
+    plt.title("Horizontal Phase Space (Oscillatory)")
+    plt.subplot(1, 2, 2)
+    plt.plot(x_s[:1000, 1], v_s[:1000, 1], color='red')
+    plt.title("Vertical Phase Space (Oscillatory)")
     plt.show()
